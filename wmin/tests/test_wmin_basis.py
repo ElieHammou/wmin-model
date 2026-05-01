@@ -8,12 +8,14 @@ Tests are written using only functions without classes.
 import os
 import shutil
 import tempfile
+import types
 from unittest.mock import patch, MagicMock
 import numpy as np
 
 # Now import the module under test
 from wmin.basis import (
     n3fit_pdf_model,
+    n3fit_pdf_grid,
     get_X_matrix,
     pod_basis,
     write_pod_basis,
@@ -74,6 +76,42 @@ def test_n3fit_pdf_model():
         assert replicas_settings[0].activations == ["relu", "sigmoid"]
 
 
+def test_n3fit_pdf_grid_uses_runcard_lhapdf_set():
+    """n3fit_pdf_grid should pass the provided lhapdf_set to lhapdf.mkPDF."""
+
+    mock_pdf = MagicMock()
+    mock_pdf.xfxQ.return_value = 1.0
+    mock_lhapdf = types.SimpleNamespace(mkPDF=MagicMock(return_value=mock_pdf))
+
+    class DummyModel:
+        def __init__(self):
+            self.x_in = None
+            self.evolution_labels = ["g", "sigma"]
+
+        def __call__(self, _inputs):
+            # Shape: (1, nreplicas, nx, nflavours)
+            return np.ones((1, 2, 3, 2), dtype=float)
+
+    with patch("wmin.basis.LHAPDF_XGRID", [0.1, 0.2, 0.3]), patch(
+        "wmin.basis.FLAVOUR_TO_ID_MAPPING", {"g": 0, "\\Sigma": 1}
+    ), patch(
+        "wmin.basis.flavour_to_evolution_matrix", [[1.0, 0.0], [0.0, 1.0]]
+    ), patch("wmin.basis.EXPORT_LABELS", ["GLUON", "D"]), patch.dict(
+        "sys.modules", {"lhapdf": mock_lhapdf}
+    ):
+        pdf_grid = n3fit_pdf_grid(
+            DummyModel(),
+            filter_arclength_outliers=False,
+            overwrite_non_gluon_from_lhapdf=True,
+            lhapdf_set="CUSTOM_SET",
+            lhapdf_member=3,
+            lhapdf_q=2.0,
+        )
+
+    mock_lhapdf.mkPDF.assert_called_once_with("CUSTOM_SET", 3)
+    assert pdf_grid.shape == (2, 2, 3)
+
+
 def test_get_X_matrix():
     """Test get_X_matrix function."""
 
@@ -127,31 +165,38 @@ def test_write_pod_basis():
     print("Testing write_pod_basis...")
 
     with patch("wmin.basis.write_exportgrid") as mock_write:
-        with patch("wmin.basis.os.path.exists", return_value=False):
-            with patch("wmin.basis.os.mkdir") as mock_mkdir:
+        # Create test data
+        pod = np.array(
+            [
+                [[3.0, 0.0], [0.0, 4.0]],
+                [[0.0, 1.0], [2.0, 2.0]],
+            ]
+        )
+        phi0 = np.zeros((2, 2))
+        pod_basis_data = (pod, phi0)
 
-                # Create test data
-                pod = np.random.rand(3, 2, 4)  # (Neig, nflavours, nx)
-                phi0 = np.random.rand(2, 4)  # (nflavours, nx)
-                pod_basis_data = (pod, phi0)
+        temp_dir = tempfile.mkdtemp()
+        output_path = temp_dir
 
-                temp_dir = tempfile.mkdtemp()
-                output_path = os.path.join(temp_dir, "test_fit")
+        try:
+            write_pod_basis(pod_basis_data, output_path)
 
-                try:
-                    write_pod_basis(pod_basis_data, output_path)
+            # Check that write_exportgrid was called correct number of times
+            assert mock_write.call_count == pod.shape[0]
 
-                    # Check that directories were created
-                    mock_mkdir.assert_called()
+            # Check first call (central member)
+            first_call = mock_write.call_args_list[0]
+            args, kwargs = first_call
+            np.testing.assert_array_equal(kwargs["grid_for_writing"], phi0)
+            assert kwargs["replica_index"] == 1
 
-                    # Check that write_exportgrid was called correct number of times
-                    assert mock_write.call_count == pod.shape[0]
+            eigenvalues_path = os.path.join(output_path, "pod_eigenvalues.csv")
+            assert os.path.exists(eigenvalues_path)
+            spectrum = np.loadtxt(eigenvalues_path, delimiter=",", skiprows=1)
 
-                    # Check first call (central member)
-                    first_call = mock_write.call_args_list[0]
-                    args, kwargs = first_call
-                    np.testing.assert_array_equal(kwargs["grid_for_writing"], phi0)
-                    assert kwargs["replica_index"] == 1
+            np.testing.assert_allclose(spectrum[:, 0], [1.0, 2.0])
+            np.testing.assert_allclose(spectrum[:, 1], [25.0, 9.0])
+            np.testing.assert_allclose(spectrum[:, 2], [1.0, 9.0 / 25.0])
 
-                finally:
-                    shutil.rmtree(temp_dir, ignore_errors=True)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
